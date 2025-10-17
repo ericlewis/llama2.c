@@ -1,0 +1,54 @@
+name: PR Delta Reporter
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  comment-diff:
+    name: Post delta summary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate delta summary
+        id: diff
+        run: |
+          git fetch --no-tags --prune --depth=1 origin "${{ github.event.pull_request.base.ref }}"
+          git diff --stat --compact-summary "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}" > diff.txt
+          if [ ! -s diff.txt ]; then
+            echo "summary=No code changes detected." >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo 'summary<<EOF'
+              cat diff.txt
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find existing delta comment
+        id: find-comment
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- delta-report -->'
+
+      - name: Post delta comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          body: |
+            <!-- delta-report -->
+            ### Delta Summary
+            ```
+            ${{ steps.diff.outputs.summary }}
+            ```
