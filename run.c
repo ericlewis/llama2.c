@@ -60,7 +60,6 @@ typedef struct {
     float *v; // value (dim,)
     float *att; // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
-    float *rope_freq_cache; // cached inverse frequencies for RoPE rotation (head_size/2,)
     // kv cache
     float* key_cache;   // (layer, seq_len, dim)
     float* value_cache; // (layer, seq_len, dim)
@@ -79,7 +78,6 @@ typedef struct {
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    int head_size = p->dim / p->n_heads;
     s->x = calloc(p->dim, sizeof(float));
     s->xb = calloc(p->dim, sizeof(float));
     s->xb2 = calloc(p->dim, sizeof(float));
@@ -90,20 +88,9 @@ void malloc_run_state(RunState* s, Config* p) {
     s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
-    s->rope_freq_cache = NULL;
-    if (head_size >= 2) {
-        int rope_freq_count = head_size / 2;
-        s->rope_freq_cache = (float*)malloc(rope_freq_count * sizeof(float));
-        if (!s->rope_freq_cache) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
-        const float inv_head_size = 2.0f / (float)head_size;
-        for (int i = 0; i < rope_freq_count; i++) {
-            s->rope_freq_cache[i] = powf(10000.0f, -(float)i * inv_head_size);
-        }
-    }
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->key_cache || !s->value_cache || !s->att || !s->logits
-     || (head_size >= 2 && !s->rope_freq_cache)) {
+     || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
         fprintf(stderr, "malloc failed!\n");
         exit(EXIT_FAILURE);
     }
@@ -118,7 +105,6 @@ void free_run_state(RunState* s) {
     free(s->q);
     free(s->att);
     free(s->logits);
-    free(s->rope_freq_cache);
     free(s->key_cache);
     free(s->value_cache);
 }
@@ -229,22 +215,15 @@ void softmax(float* x, int size) {
     }
 }
 
-#if defined(_MSC_VER)
-#define RESTRICT __restrict
-#else
-#define RESTRICT restrict
-#endif
-
-void matmul(float* RESTRICT xout, const float* RESTRICT x, const float* RESTRICT w, int n, int d) {
+void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
-    #pragma omp parallel for
-    for (int i = 0; i < d; i++) {
-        const float* wrow = w + (size_t)i * n;
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
         float val = 0.0f;
-        #pragma omp simd reduction(+:val)
         for (int j = 0; j < n; j++) {
-            val += wrow[j] * x[j];
+            val += w[i * n + j] * x[j];
         }
         xout[i] = val;
     }
@@ -262,7 +241,6 @@ float* forward(Transformer* transformer, int token, int pos) {
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
     int hidden_dim =  p->hidden_dim;
     int head_size = dim / p->n_heads;
-    const float inv_sqrt_head_size = 1.0f / sqrtf((float)head_size);
 
     // copy the token embedding into x
     float* content_row = w->token_embedding_table + token * dim;
@@ -285,55 +263,19 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        if (s->rope_freq_cache) {
-            float* rope_freq = s->rope_freq_cache;
-            int rope_freq_count = head_size / 2;
-            if (rope_freq_count > 0) {
-                float cos_cache[rope_freq_count];
-                float sin_cache[rope_freq_count];
-                for (int j = 0; j < rope_freq_count; j++) {
-                    float val = pos * rope_freq[j];
-                    cos_cache[j] = cosf(val);
-                    sin_cache[j] = sinf(val);
-                }
-                for (int h = 0; h < p->n_heads; h++) {
-                    float* q_head = s->q + h * head_size;
-                    for (int i = 0, j = 0; j < rope_freq_count && (i + 1) < head_size; i += 2, j++) {
-                        float fcr = cos_cache[j];
-                        float fci = sin_cache[j];
-                        float v0 = q_head[i];
-                        float v1 = q_head[i+1];
-                        q_head[i]   = v0 * fcr - v1 * fci;
-                        q_head[i+1] = v0 * fci + v1 * fcr;
-                    }
-                }
-                for (int h = 0; h < p->n_kv_heads; h++) {
-                    float* k_head = s->k + h * head_size;
-                    for (int i = 0, j = 0; j < rope_freq_count && (i + 1) < head_size; i += 2, j++) {
-                        float fcr = cos_cache[j];
-                        float fci = sin_cache[j];
-                        float v0 = k_head[i];
-                        float v1 = k_head[i+1];
-                        k_head[i]   = v0 * fcr - v1 * fci;
-                        k_head[i+1] = v0 * fci + v1 * fcr;
-                    }
-                }
-            }
-        } else {
-            for (int i = 0; i < dim; i+=2) {
-                int head_dim = i % head_size;
-                float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-                float val = pos * freq;
-                float fcr = cosf(val);
-                float fci = sinf(val);
-                int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
-                for (int v = 0; v < rotn; v++) {
-                    float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
-                    float v0 = vec[i];
-                    float v1 = vec[i+1];
-                    vec[i]   = v0 * fcr - v1 * fci;
-                    vec[i+1] = v0 * fci + v1 * fcr;
-                }
+        for (int i = 0; i < dim; i+=2) {
+            int head_dim = i % head_size;
+            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float val = pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
+            int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+            for (int v = 0; v < rotn; v++) {
+                float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
+                float v0 = vec[i];
+                float v1 = vec[i+1];
+                vec[i]   = v0 * fcr - v1 * fci;
+                vec[i+1] = v0 * fci + v1 * fcr;
             }
         }
 
@@ -354,7 +296,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                 for (int i = 0; i < head_size; i++) {
                     score += q[i] * k[i];
                 }
-                score *= inv_sqrt_head_size;
+                score /= sqrtf(head_size);
                 // save the score to the attention buffer
                 att[t] = score;
             }

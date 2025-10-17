@@ -35,6 +35,156 @@ pub const TransformerWeights = struct {
     wcls: []const f32,
 };
 
+const Checkpoint = struct {
+    config: Config,
+    weights: TransformerWeights,
+    buffer: []f32,
+
+    pub fn load(allocator: Allocator, path: []const u8) !Checkpoint {
+        var file = try std.fs.cwd().openFile(path, .{ .read = true });
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        if (file_size < @sizeOf(i32) * 7) {
+            return error.InvalidCheckpoint;
+        }
+
+        var bytes = try allocator.alloc(u8, file_size);
+        defer allocator.free(bytes);
+        try file.reader().readNoEof(bytes);
+
+        var cursor: usize = 0;
+        var raw_config: [7]i32 = undefined;
+        var idx: usize = 0;
+        while (idx < raw_config.len) : (idx += 1) {
+            raw_config[idx] = std.mem.readIntLittle(i32, bytes[cursor .. cursor + 4]);
+            cursor += 4;
+        }
+
+        var config = Config{
+            .dim = @intCast(usize, raw_config[0]),
+            .hidden_dim = @intCast(usize, raw_config[1]),
+            .n_layers = @intCast(usize, raw_config[2]),
+            .n_heads = @intCast(usize, raw_config[3]),
+            .n_kv_heads = @intCast(usize, raw_config[4]),
+            .vocab_size = 0,
+            .seq_len = @intCast(usize, raw_config[6]),
+        };
+        const raw_vocab = raw_config[5];
+        const shared_weights = raw_vocab >= 0;
+        config.vocab_size = @intCast(usize, if (shared_weights) raw_vocab else -raw_vocab);
+
+        if (config.n_heads == 0 or config.n_kv_heads == 0 or config.dim == 0) {
+            return error.InvalidCheckpoint;
+        }
+        if (config.dim % config.n_heads != 0) {
+            return error.InvalidCheckpoint;
+        }
+        if (config.n_heads % config.n_kv_heads != 0) {
+            return error.InvalidCheckpoint;
+        }
+
+        const remaining_bytes = bytes[cursor..];
+        if (remaining_bytes.len % @sizeOf(f32) != 0) {
+            return error.InvalidCheckpoint;
+        }
+        const float_count = remaining_bytes.len / @sizeOf(f32);
+        var buffer = try allocator.alloc(f32, float_count);
+        var f_index: usize = 0;
+        while (f_index < float_count) : (f_index += 1) {
+            const start = cursor + f_index * @sizeOf(f32);
+            const word = std.mem.readIntLittle(u32, bytes[start .. start + @sizeOf(f32)]);
+            buffer[f_index] = @bitCast(f32, word);
+        }
+
+        var offset: usize = 0;
+        const head_size = config.headSize();
+        const kv_dim = config.kvDim();
+        const n_layers = config.n_layers;
+
+        const take = struct {
+            fn slice(buf: []f32, index: *usize, count: usize) ![]f32 {
+                if (count == 0) {
+                    return buf[index.* .. index.*];
+                }
+                if (index.* + count > buf.len) {
+                    return error.InvalidCheckpoint;
+                }
+                const slice = buf[index.* .. index.* + count];
+                index.* += count;
+                return slice;
+            }
+        };
+
+        var weights = TransformerWeights{
+            .token_embedding_table = try take.slice(buffer, &offset, config.vocab_size * config.dim),
+            .rms_att_weight = try take.slice(buffer, &offset, n_layers * config.dim),
+            .rms_ffn_weight = undefined,
+            .wq = try take.slice(buffer, &offset, n_layers * config.dim * config.dim),
+            .wk = try take.slice(buffer, &offset, n_layers * config.dim * kv_dim),
+            .wv = try take.slice(buffer, &offset, n_layers * config.dim * kv_dim),
+            .wo = try take.slice(buffer, &offset, n_layers * config.dim * config.dim),
+            .w1 = undefined,
+            .w2 = undefined,
+            .w3 = undefined,
+            .rms_final_weight = undefined,
+            .wcls = &[_]f32{},
+        };
+        weights.rms_ffn_weight = try take.slice(buffer, &offset, n_layers * config.dim);
+        weights.w1 = try take.slice(buffer, &offset, n_layers * config.dim * config.hidden_dim);
+        weights.w2 = try take.slice(buffer, &offset, n_layers * config.hidden_dim * config.dim);
+        weights.w3 = try take.slice(buffer, &offset, n_layers * config.dim * config.hidden_dim);
+        weights.rms_final_weight = try take.slice(buffer, &offset, config.dim);
+
+        const rope_skip = (config.seq_len * head_size) / 2;
+        if (rope_skip > 0) {
+            _ = try take.slice(buffer, &offset, rope_skip);
+            _ = try take.slice(buffer, &offset, rope_skip);
+        }
+
+        if (shared_weights) {
+            weights.wcls = weights.token_embedding_table;
+        } else {
+            weights.wcls = try take.slice(buffer, &offset, config.vocab_size * config.dim);
+        }
+
+        return Checkpoint{
+            .config = config,
+            .weights = weights,
+            .buffer = buffer,
+        };
+    }
+
+    pub fn deinit(self: *Checkpoint, allocator: Allocator) void {
+        const original = self.buffer;
+        allocator.free(original);
+        self.buffer = original[0..0];
+        self.config = Config{
+            .dim = 0,
+            .hidden_dim = 0,
+            .n_layers = 0,
+            .n_heads = 0,
+            .n_kv_heads = 0,
+            .vocab_size = 0,
+            .seq_len = 0,
+        };
+        self.weights = TransformerWeights{
+            .token_embedding_table = &[_]f32{},
+            .rms_att_weight = &[_]f32{},
+            .rms_ffn_weight = &[_]f32{},
+            .wq = &[_]f32{},
+            .wk = &[_]f32{},
+            .wv = &[_]f32{},
+            .wo = &[_]f32{},
+            .w1 = &[_]f32{},
+            .w2 = &[_]f32{},
+            .w3 = &[_]f32{},
+            .rms_final_weight = &[_]f32{},
+            .wcls = &[_]f32{},
+        };
+    }
+};
+
 const RopeFreqCache = struct {
     inv_freq: []f32,
 
@@ -333,7 +483,7 @@ pub fn forward(
     const dim = config.dim;
     const kv_dim = config.kvDim();
     const head_size = config.headSize();
-    std.mem.copy(f32, state.x, weights.token_embedding_table[token * dim .. (token + 1) * dim]);
+    std.mem.copyForwards(f32, state.x, weights.token_embedding_table[token * dim .. (token + 1) * dim]);
 
     const head_scale = 1.0 / math.sqrt(@as(f32, @floatFromInt(head_size)));
 
@@ -381,6 +531,92 @@ pub fn forward(
 }
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        _ = gpa.deinit();
+    }
+    const allocator = gpa.allocator();
+
+    var args = std.process.args();
+    const prog = args.next() orelse "zig-run";
+    const stderr = std.io.getStdErr().writer();
+    const checkpoint_path = args.next() orelse {
+        try stderr.print("Usage: {s} <checkpoint> [--steps N] [--warmup N]\n", .{prog});
+        return;
+    };
+
+    var steps: usize = 128;
+    var warmup: usize = 8;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--steps")) {
+            const value = args.next() orelse {
+                try stderr.print("missing value for --steps\n", .{});
+                return error.InvalidUsage;
+            };
+            steps = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, arg, "--warmup")) {
+            const value = args.next() orelse {
+                try stderr.print("missing value for --warmup\n", .{});
+                return error.InvalidUsage;
+            };
+            warmup = try std.fmt.parseInt(usize, value, 10);
+        } else {
+            try stderr.print("unrecognized argument: {s}\n", .{arg});
+            return error.InvalidUsage;
+        }
+    }
+
+    var checkpoint = try Checkpoint.load(allocator, checkpoint_path);
+    defer checkpoint.deinit(allocator);
+
+    var state = try RunState.init(allocator, checkpoint.config);
+    defer state.deinit(allocator);
+
+    const seq_len = checkpoint.config.seq_len;
+    if (seq_len == 0) {
+        return error.InvalidCheckpoint;
+    }
+
+    if (warmup > seq_len) {
+        warmup = seq_len;
+    }
+
+    var pos: usize = 0;
+    var token: usize = 0;
+    const vocab = checkpoint.config.vocab_size;
+
+    while (pos < warmup and pos < seq_len) : (pos += 1) {
+        forward(checkpoint.config, checkpoint.weights, &state, token % vocab, pos);
+        token += 1;
+    }
+
+    var remaining = seq_len - pos;
+    if (steps == 0 or steps > remaining) {
+        steps = remaining;
+    }
+
+    if (steps == 0) {
+        const stdout = std.io.getStdOut().writer();
+        try stdout.print("achieved tok/s: {d:.6}\n", .{0.0});
+        return;
+    }
+
+    const start_ns = std.time.nanoTimestamp();
+    var measured: usize = 0;
+    while (measured < steps and pos < seq_len) : (measured += 1) {
+        forward(checkpoint.config, checkpoint.weights, &state, token % vocab, pos);
+        pos += 1;
+        token += 1;
+    }
+    const end_ns = std.time.nanoTimestamp();
+
+    const elapsed_ns_signed = end_ns - start_ns;
+    const elapsed_ns = @as(f64, @floatFromInt(elapsed_ns_signed));
+    const elapsed_s = elapsed_ns / @as(f64, std.time.ns_per_s);
+    const tokens_done = @as(f64, @floatFromInt(measured));
+    const tps = if (elapsed_s > 0.0) tokens_done / elapsed_s else 0.0;
+
     const stdout = std.io.getStdOut().writer();
-    try stdout.print("Zig port placeholder.\n", .{});
+    try stdout.print("achieved tok/s: {d:.6}\n", .{tps});
 }
