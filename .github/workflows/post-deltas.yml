@@ -1,0 +1,120 @@
+name: PR Throughput Delta
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  throughput:
+    name: Benchmark delta
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build essentials
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3
+
+      - name: Install Zig 0.11.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.11.0
+
+      - name: Generate dummy checkpoint
+        run: |
+          python3 scripts/generate_dummy_checkpoint.py \
+            bench/benchmark.ckpt \
+            --dim 64 \
+            --hidden-dim 128 \
+            --layers 2 \
+            --heads 4 \
+            --kv-heads 4 \
+            --vocab 256 \
+            --seq-len 128 \
+            --seed 42
+
+      - name: Build C benchmark
+        run: gcc -O3 -I. -o bench/c_bench bench/tps_bench.c -lm
+
+      - name: Build Zig benchmark
+        run: zig build-exe zig/run.zig -O ReleaseFast -femit-bin=bench/zig-bench
+
+      - name: Run C benchmark
+        id: cbench
+        run: |
+          output=$(./bench/c_bench bench/benchmark.ckpt 128)
+          echo "$output"
+          BENCH_OUTPUT="$output" python3 - <<'PY'
+import os
+import re
+out = os.environ["BENCH_OUTPUT"]
+match = re.search(r'([0-9]+(?:\.\d+)?)', out)
+if not match:
+    raise SystemExit("could not parse C throughput")
+with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+    handle.write(f"tps={match.group(1)}\n")
+PY
+
+      - name: Run Zig benchmark
+        id: zigbench
+        run: |
+          output=$(./bench/zig-bench bench/benchmark.ckpt --steps 128)
+          echo "$output"
+          BENCH_OUTPUT="$output" python3 - <<'PY'
+import os
+import re
+out = os.environ["BENCH_OUTPUT"]
+match = re.search(r'([0-9]+(?:\.\d+)?)', out)
+if not match:
+    raise SystemExit("could not parse Zig throughput")
+with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+    handle.write(f"tps={match.group(1)}\n")
+PY
+
+      - name: Format throughput summary
+        id: summary
+        run: |
+          C_TPS=${{ steps.cbench.outputs.tps }}
+          ZIG_TPS=${{ steps.zigbench.outputs.tps }}
+          python3 - <<'PY'
+import os
+from decimal import Decimal
+c_tps = Decimal(os.environ['C_TPS'])
+zig_tps = Decimal(os.environ['ZIG_TPS'])
+delta = zig_tps - c_tps
+summary = "| Runner | tok/s |\n| --- | ---: |\n" \
+           + f"| run.c | {c_tps:.3f} |\n" \
+           + f"| zig | {zig_tps:.3f} |\n" \
+           + f"| Δ (zig - run.c) | {delta:.3f} |"
+with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as handle:
+    handle.write('summary<<EOF\n')
+    handle.write(summary)
+    handle.write('\nEOF\n')
+PY
+
+      - name: Find existing delta comment
+        id: find-comment
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '<!-- throughput-delta -->'
+
+      - name: Post delta comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          body: |
+            <!-- throughput-delta -->
+            ### Throughput Delta
+            ```
+            ${{ steps.summary.outputs.summary }}
+            ```
