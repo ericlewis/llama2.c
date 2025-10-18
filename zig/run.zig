@@ -41,7 +41,7 @@ const Checkpoint = struct {
     buffer: []f32,
 
     pub fn load(allocator: Allocator, path: []const u8) !Checkpoint {
-        var file = try std.fs.cwd().openFile(path, .{ .read = true });
+        var file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
         defer file.close();
 
         const file_size = try file.getEndPos();
@@ -57,22 +57,24 @@ const Checkpoint = struct {
         var raw_config: [7]i32 = undefined;
         var idx: usize = 0;
         while (idx < raw_config.len) : (idx += 1) {
-            raw_config[idx] = std.mem.readIntLittle(i32, bytes[cursor .. cursor + 4]);
+            const config_bytes = bytes[cursor .. cursor + 4];
+            const config_ptr: *const [4]u8 = @ptrCast(config_bytes.ptr);
+            raw_config[idx] = std.mem.readIntLittle(i32, config_ptr);
             cursor += 4;
         }
 
         var config = Config{
-            .dim = @intCast(usize, raw_config[0]),
-            .hidden_dim = @intCast(usize, raw_config[1]),
-            .n_layers = @intCast(usize, raw_config[2]),
-            .n_heads = @intCast(usize, raw_config[3]),
-            .n_kv_heads = @intCast(usize, raw_config[4]),
+            .dim = @intCast(raw_config[0]),
+            .hidden_dim = @intCast(raw_config[1]),
+            .n_layers = @intCast(raw_config[2]),
+            .n_heads = @intCast(raw_config[3]),
+            .n_kv_heads = @intCast(raw_config[4]),
             .vocab_size = 0,
-            .seq_len = @intCast(usize, raw_config[6]),
+            .seq_len = @intCast(raw_config[6]),
         };
         const raw_vocab = raw_config[5];
         const shared_weights = raw_vocab >= 0;
-        config.vocab_size = @intCast(usize, if (shared_weights) raw_vocab else -raw_vocab);
+        config.vocab_size = @intCast(if (shared_weights) raw_vocab else -raw_vocab);
 
         if (config.n_heads == 0 or config.n_kv_heads == 0 or config.dim == 0) {
             return error.InvalidCheckpoint;
@@ -93,8 +95,10 @@ const Checkpoint = struct {
         var f_index: usize = 0;
         while (f_index < float_count) : (f_index += 1) {
             const start = cursor + f_index * @sizeOf(f32);
-            const word = std.mem.readIntLittle(u32, bytes[start .. start + @sizeOf(f32)]);
-            buffer[f_index] = @bitCast(f32, word);
+            const word_bytes = bytes[start .. start + @sizeOf(f32)];
+            const word_ptr: *const [@sizeOf(f32)]u8 = @ptrCast(word_bytes.ptr);
+            const word = std.mem.readIntLittle(u32, word_ptr);
+            buffer[f_index] = @as(f32, @bitCast(word));
         }
 
         var offset: usize = 0;
@@ -105,14 +109,14 @@ const Checkpoint = struct {
         const take = struct {
             fn slice(buf: []f32, index: *usize, count: usize) ![]f32 {
                 if (count == 0) {
-                    return buf[index.* .. index.*];
+                    return buf[index.*..index.*];
                 }
                 if (index.* + count > buf.len) {
                     return error.InvalidCheckpoint;
                 }
-                const slice = buf[index.* .. index.* + count];
+                const result = buf[index.* .. index.* + count];
                 index.* += count;
-                return slice;
+                return result;
             }
         };
 
@@ -236,11 +240,10 @@ pub const RopeCosSinCache = struct {
             var i: usize = 0;
             while (i < freq.inv_freq.len) : (i += 1) {
                 const angle = theta_t * freq.inv_freq[i];
-                var s: f64 = 0;
-                var c: f64 = 0;
-                math.sincos(@as(f64, angle), &s, &c);
-                cos_table[base_index + i] = @as(f32, @floatCast(c));
-                sin_table[base_index + i] = @as(f32, @floatCast(s));
+                const sin_val = @sin(@as(f64, angle));
+                const cos_val = @cos(@as(f64, angle));
+                cos_table[base_index + i] = @as(f32, @floatCast(cos_val));
+                sin_table[base_index + i] = @as(f32, @floatCast(sin_val));
             }
         }
         return RopeCosSinCache{
@@ -385,7 +388,7 @@ fn rmsNorm(out: []f32, inp: []const f32, weight: []const f32) void {
         ss += v * v;
     }
     const mean = ss / @as(f32, @floatFromInt(inp.len));
-    const inv = math.rsqrt(mean + 1e-5);
+    const inv = 1.0 / @sqrt(mean + 1e-5);
     var i: usize = 0;
     while (i < inp.len) : (i += 1) {
         out[i] = weight[i] * (inp[i] * inv);
